@@ -1,0 +1,257 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Torrent Video Streamer</title>
+    <script src="https://cdn.jsdelivr.net/npm/hls.js@latest"></script>
+    <style>
+        body {
+            font-family: Arial, sans-serif;
+            max-width: 800px;
+            margin: 0 auto;
+            padding: 20px;
+            background-color: #f0f0f0;
+        }
+        .container {
+            background-color: white;
+            padding: 20px;
+            border-radius: 8px;
+            box-shadow: 0 2px 4px rgba(0,0,0,0.1);
+        }
+        #videoPlayer {
+            width: 100%;
+            margin: 20px 0;
+            background-color: black;
+        }
+        .input-group {
+            margin-bottom: 20px;
+        }
+        input[type="text"] {
+            width: 100%;
+            padding: 10px;
+            margin-bottom: 10px;
+            border: 1px solid #ddd;
+            border-radius: 4px;
+        }
+        button {
+            background-color: #4CAF50;
+            color: white;
+            padding: 10px 20px;
+            border: none;
+            border-radius: 4px;
+            cursor: pointer;
+        }
+        button:hover {
+            background-color: #45a049;
+        }
+        button:disabled {
+            background-color: #cccccc;
+            cursor: not-allowed;
+        }
+        #status {
+            margin-top: 10px;
+            padding: 10px;
+            border-radius: 4px;
+        }
+        .error {
+            background-color: #ffebee;
+            color: #c62828;
+        }
+        .success {
+            background-color: #e8f5e9;
+            color: #2e7d32;
+        }
+        #fileList {
+            margin: 20px 0;
+            display: none;
+        }
+        .file-item {
+            padding: 10px;
+            margin: 5px 0;
+            background-color: #f5f5f5;
+            border-radius: 4px;
+            cursor: pointer;
+            transition: background-color 0.2s;
+        }
+        .file-item:hover {
+            background-color: #e0e0e0;
+        }
+        .file-item.selected {
+            background-color: #e8f5e9;
+            border: 1px solid #4CAF50;
+        }
+        .file-size {
+            float: right;
+            color: #666;
+        }
+        #loadingSpinner {
+            display: none;
+            text-align: center;
+            margin: 20px 0;
+        }
+        .spinner {
+            border: 4px solid #f3f3f3;
+            border-top: 4px solid #4CAF50;
+            border-radius: 50%;
+            width: 30px;
+            height: 30px;
+            animation: spin 1s linear infinite;
+            margin: 0 auto;
+        }
+        @keyframes spin {
+            0% { transform: rotate(0deg); }
+            100% { transform: rotate(360deg); }
+        }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <h1>Torrent Video Streamer</h1>
+        <div class="input-group">
+            <input type="text" id="magnetLink" placeholder="Paste magnet link here...">
+            <button onclick="loadFiles()" id="loadButton">Load Files</button>
+        </div>
+        
+        <div id="loadingSpinner">
+            <div class="spinner"></div>
+            <p>Loading files from torrent...</p>
+        </div>
+
+        <div id="fileList"></div>
+        <video id="videoPlayer" controls style="display: none;"></video>
+        <div id="status"></div>
+    </div>
+
+    <script>
+        let currentStreamId = null;
+        let currentTorrentId = null;
+
+        function formatFileSize(bytes) {
+            const sizes = ['Bytes', 'KB', 'MB', 'GB', 'TB'];
+            if (bytes === 0) return '0 Byte';
+            const i = parseInt(Math.floor(Math.log(bytes) / Math.log(1024)));
+            return Math.round(100 * bytes / Math.pow(1024, i)) / 100 + ' ' + sizes[i];
+        }
+
+        async function loadFiles() {
+            const magnetLink = document.getElementById('magnetLink').value;
+            const status = document.getElementById('status');
+            const loadingSpinner = document.getElementById('loadingSpinner');
+            const fileList = document.getElementById('fileList');
+            const loadButton = document.getElementById('loadButton');
+
+            if (!magnetLink) {
+                status.textContent = 'Please enter a magnet link';
+                status.className = 'error';
+                return;
+            }
+
+            try {
+                loadButton.disabled = true;
+                loadingSpinner.style.display = 'block';
+                fileList.style.display = 'none';
+                status.textContent = '';
+
+                const response = await fetch('http://localhost:3000/files', {
+                    method: 'POST',
+                    headers: {
+                        'Content-Type': 'application/json',
+                    },
+                    body: JSON.stringify({ magnetLink }),
+                });
+
+                if (!response.ok) {
+                    throw new Error('Failed to load files');
+                }
+
+                const data = await response.json();
+                currentTorrentId = data.torrentId;
+
+                // Display file list
+                fileList.innerHTML = data.files.map((file, index) => `
+                    <div class="file-item" onclick="startStream(${index})">
+                        <span>${file.name}</span>
+                        <span class="file-size">${formatFileSize(file.length)}</span>
+                    </div>
+                `).join('');
+
+                fileList.style.display = 'block';
+                status.textContent = 'Select a file to start streaming';
+                status.className = 'success';
+            } catch (error) {
+                console.error('Error:', error);
+                status.textContent = 'Error loading files: ' + error.message;
+                status.className = 'error';
+            } finally {
+                loadButton.disabled = false;
+                loadingSpinner.style.display = 'none';
+            }
+        }
+
+        async function startStream(fileIndex) {
+            const status = document.getElementById('status');
+            const video = document.getElementById('videoPlayer');
+            const fileItems = document.querySelectorAll('.file-item');
+
+            try {
+                status.textContent = 'Starting stream...';
+                status.className = '';
+
+                // Update UI selection
+                fileItems.forEach((item, i) => {
+                    item.className = 'file-item' + (i === fileIndex ? ' selected' : '');
+                });
+
+                const response = await fetch('http://localhost:3000/stream', {
+                    method: 'POST',
+                    headers: {
+                        'Content-Type': 'application/json',
+                    },
+                    body: JSON.stringify({ 
+                        torrentId: currentTorrentId,
+                        fileIndex: fileIndex 
+                    }),
+                });
+
+                if (!response.ok) {
+                    throw new Error('Failed to start stream');
+                }
+
+                const data = await response.json();
+                currentStreamId = data.streamId;
+
+                if (Hls.isSupported()) {
+                    const hls = new Hls();
+                    hls.loadSource(`http://localhost:3000${data.playlistUrl}`);
+                    hls.attachMedia(video);
+                    hls.on(Hls.Events.MANIFEST_PARSED, function() {
+                        video.style.display = 'block';
+                        video.play();
+                    });
+                }
+                
+                status.textContent = `Streaming: ${data.fileName}`;
+                status.className = 'success';
+            } catch (error) {
+                console.error('Error:', error);
+                status.textContent = 'Error starting stream: ' + error.message;
+                status.className = 'error';
+            }
+        }
+
+        // Cleanup when leaving the page
+        window.addEventListener('beforeunload', async () => {
+            if (currentStreamId) {
+                try {
+                    await fetch(`http://localhost:3000/stream/${currentStreamId}`, {
+                        method: 'DELETE'
+                    });
+                } catch (error) {
+                    console.error('Error cleaning up stream:', error);
+                }
+            }
+        });
+    </script>
+</body>
+</html> 
