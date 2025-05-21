@@ -7,8 +7,20 @@ const fs = require('fs');
 
 const app = express();
 const port = 3000;
+const serverIP = '52.168.128.120'; // Your server IP
 
-app.use(cors());
+// Configure CORS
+app.use(cors({
+    origin: [
+        `http://${serverIP}`,
+        `http://${serverIP}:${port}`,
+        'http://localhost',
+        'http://localhost:3000'
+    ],
+    methods: ['GET', 'POST', 'DELETE'],
+    credentials: true
+}));
+
 app.use(express.json());
 app.use(express.static('public'));
 
@@ -131,7 +143,8 @@ app.post('/stream', async (req, res) => {
         const streamId = `${torrentId}_${fileIndex}`;
         
         engine.server.on('listening', () => {
-            const sourceUrl = `http://localhost:${engine.server.address().port}`;
+            const serverPort = engine.server.address().port;
+            const sourceUrl = `http://${serverIP}:${serverPort}`;
             
             // Create HLS output directory for this stream
             const streamHlsDir = path.join(hlsOutputDir, streamId);
@@ -193,6 +206,7 @@ app.delete('/stream/:streamId', (req, res) => {
     }
 });
 
-app.listen(port, () => {
-    console.log(`Server running at http://localhost:${port}`);
+// Listen on all network interfaces
+app.listen(port, '0.0.0.0', () => {
+    console.log(`Server running at http://${serverIP}:${port}`);
 }); 

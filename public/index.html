@@ -124,6 +124,7 @@
     </div>
 
     <script>
+        const SERVER_URL = 'http://52.168.128.120:3000';
         let currentStreamId = null;
         let currentTorrentId = null;
 
@@ -153,7 +154,7 @@
                 fileList.style.display = 'none';
                 status.textContent = '';
 
-                const response = await fetch('http://localhost:3000/files', {
+                const response = await fetch(`${SERVER_URL}/files`, {
                     method: 'POST',
                     headers: {
                         'Content-Type': 'application/json',
@@ -203,7 +204,7 @@
                     item.className = 'file-item' + (i === fileIndex ? ' selected' : '');
                 });
 
-                const response = await fetch('http://localhost:3000/stream', {
+                const response = await fetch(`${SERVER_URL}/stream`, {
                     method: 'POST',
                     headers: {
                         'Content-Type': 'application/json',
@@ -223,7 +224,7 @@
 
                 if (Hls.isSupported()) {
                     const hls = new Hls();
-                    hls.loadSource(`http://localhost:3000${data.playlistUrl}`);
+                    hls.loadSource(`${SERVER_URL}${data.playlistUrl}`);
                     hls.attachMedia(video);
                     hls.on(Hls.Events.MANIFEST_PARSED, function() {
                         video.style.display = 'block';
@@ -244,7 +245,7 @@
         window.addEventListener('beforeunload', async () => {
             if (currentStreamId) {
                 try {
-                    await fetch(`http://localhost:3000/stream/${currentStreamId}`, {
+                    await fetch(`${SERVER_URL}/stream/${currentStreamId}`, {
                         method: 'DELETE'
                     });
                 } catch (error) {
