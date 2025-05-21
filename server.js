@@ -212,27 +212,10 @@ app.post('/stream', async (req, res) => {
         engine.files.forEach((f, index) => {
             if (index === fileIndex) {
                 f.select();
+                console.log(`Selected file: ${f.name} (${f.length} bytes)`);
             } else {
                 f.deselect();
             }
-        });
-
-        // Wait for some initial pieces to download
-        await new Promise((resolve, reject) => {
-            const checkProgress = () => {
-                const progress = (engine.swarm.downloaded / file.length) * 100;
-                if (progress >= 1) { // Wait for at least 1% of the file
-                    resolve();
-                } else {
-                    setTimeout(checkProgress, 1000);
-                }
-            };
-            checkProgress();
-            
-            // Timeout after 30 seconds
-            setTimeout(() => {
-                reject(new Error('Timeout waiting for initial download'));
-            }, 30000);
         });
 
         // Generate a unique ID for this stream
@@ -244,6 +227,60 @@ app.post('/stream', async (req, res) => {
             fs.mkdirSync(streamHlsDir, { recursive: true });
         }
 
+        let initialDataReceived = false;
+        const maxRetries = 3;
+        let retryCount = 0;
+
+        // Function to wait for initial data with retry
+        const waitForInitialData = async () => {
+            return new Promise((resolve, reject) => {
+                const checkProgress = () => {
+                    const downloaded = engine.swarm.downloaded;
+                    const peers = engine.swarm.wires.length;
+                    console.log(`Download progress: ${downloaded} bytes, Peers: ${peers}`);
+
+                    // Check if we have any data at all
+                    if (downloaded > 0) {
+                        initialDataReceived = true;
+                        resolve();
+                        return;
+                    }
+
+                    // If no data and no peers, we might need to retry
+                    if (peers === 0 && !initialDataReceived) {
+                        if (retryCount < maxRetries) {
+                            retryCount++;
+                            console.log(`No peers found, retry ${retryCount}/${maxRetries}`);
+                            // Add more trackers on retry
+                            engine.discovery.announce([
+                                'udp://tracker.opentrackr.org:1337/announce',
+                                'udp://open.tracker.cl:1337/announce',
+                                'udp://9.rarbg.com:2810/announce',
+                                'udp://tracker.openbittorrent.com:6969/announce'
+                            ]);
+                        } else {
+                            reject(new Error('No peers found after retries'));
+                            return;
+                        }
+                    }
+
+                    setTimeout(checkProgress, 1000);
+                };
+
+                checkProgress();
+
+                // Set a timeout for the entire retry process
+                setTimeout(() => {
+                    if (!initialDataReceived) {
+                        reject(new Error('Timeout waiting for initial data'));
+                    }
+                }, 45000); // 45 seconds total timeout
+            });
+        };
+
+        // Wait for initial data
+        await waitForInitialData();
+
         // Start the server and get the URL
         const serverPort = await new Promise((resolve) => {
             engine.server.once('listening', () => {
@@ -252,28 +289,51 @@ app.post('/stream', async (req, res) => {
         });
 
         const sourceUrl = `http://${serverIP}:${serverPort}`;
+        console.log(`Starting stream from: ${sourceUrl}`);
 
-        // Convert stream to HLS
-        ffmpeg(sourceUrl)
+        // Convert stream to HLS with more detailed logging
+        const ffmpeg = require('fluent-ffmpeg');
+        ffmpeg.setFfmpegPath(require('@ffmpeg-installer/ffmpeg').path);
+
+        const ffmpegProcess = ffmpeg(sourceUrl)
             .outputOptions([
                 '-c:v copy',
                 '-c:a copy',
                 '-hls_time 10',
                 '-hls_list_size 6',
-                '-hls_flags delete_segments',
+                '-hls_flags delete_segments+append_list',
                 '-f hls'
             ])
             .output(path.join(streamHlsDir, 'playlist.m3u8'))
             .on('start', (cmd) => {
                 console.log('Started FFmpeg with command:', cmd);
             })
+            .on('progress', (progress) => {
+                console.log('FFmpeg Progress:', progress);
+            })
             .on('end', () => {
                 console.log('Streaming ended');
             })
-            .on('error', (err) => {
-                console.error('FFmpeg error:', err);
-            })
-            .run();
+            .on('error', (err, stdout, stderr) => {
+                console.error('FFmpeg error:', err.message);
+                console.error('FFmpeg stderr:', stderr);
+            });
+
+        // Start FFmpeg
+        ffmpegProcess.run();
+
+        // Monitor download progress for this specific stream
+        const progressInterval = setInterval(() => {
+            const downloaded = engine.swarm.downloaded;
+            const speed = engine.swarm.downloadSpeed();
+            const peers = engine.swarm.wires.length;
+            console.log(`Stream status - Downloaded: ${downloaded} bytes, Speed: ${speed} bytes/s, Peers: ${peers}`);
+        }, 5000);
+
+        // Clean up interval when stream ends
+        engine.server.once('close', () => {
+            clearInterval(progressInterval);
+        });
 
         res.json({
             streamId,
@@ -283,7 +343,14 @@ app.post('/stream', async (req, res) => {
 
     } catch (error) {
         console.error('Error starting stream:', error);
-        res.status(500).json({ error: 'Failed to start stream: ' + error.message });
+        res.status(500).json({ 
+            error: 'Failed to start stream: ' + error.message,
+            details: {
+                peers: engine?.swarm?.wires?.length || 0,
+                downloaded: engine?.swarm?.downloaded || 0,
+                message: error.message
+            }
+        });
     }
 });
 
