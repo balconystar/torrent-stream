@@ -55,21 +55,60 @@ function getVideoFiles(engine) {
         .sort((a, b) => b.length - a.length); // Sort by size, largest first
 }
 
-// Initialize torrent engine
+// Initialize torrent engine with better error handling and progress monitoring
 function initializeTorrent(magnetLink) {
     return new Promise((resolve, reject) => {
         const engine = peerflix(magnetLink, {
             connections: 100,
-            path: path.join(__dirname, 'downloads')
+            path: path.join(__dirname, 'downloads'),
+            buffer: (1024 * 1024 * 2), // 2MB buffer
+            uploads: 10,
+            tmp: path.join(__dirname, 'tmp'), // Temporary directory
+            trackers: [
+                'udp://tracker.opentrackr.org:1337/announce',
+                'udp://9.rarbg.com:2810/announce',
+                'udp://tracker.openbittorrent.com:6969/announce',
+                'udp://tracker.internetwarriors.net:1337/announce'
+            ]
         });
 
+        let isResolved = false;
+
         engine.on('ready', () => {
-            resolve(engine);
+            console.log('Torrent engine ready');
+            if (!isResolved) {
+                isResolved = true;
+                resolve(engine);
+            }
         });
 
         engine.on('error', (err) => {
-            reject(err);
+            console.error('Torrent engine error:', err);
+            if (!isResolved) {
+                isResolved = true;
+                reject(err);
+            }
         });
+
+        // Monitor download progress
+        engine.on('download', (pieceIndex) => {
+            const progress = Math.round((engine.swarm.downloaded / engine.torrent.length) * 100);
+            console.log(`Download progress: ${progress}%`);
+        });
+
+        // Monitor peer connections
+        engine.on('peer', (peer) => {
+            console.log(`Connected to peer: ${peer.address}`);
+        });
+
+        // Set a timeout for engine initialization
+        setTimeout(() => {
+            if (!isResolved) {
+                isResolved = true;
+                engine.destroy();
+                reject(new Error('Torrent engine initialization timeout'));
+            }
+        }, 30000); // 30 seconds timeout
     });
 }
 
@@ -84,9 +123,29 @@ app.post('/files', async (req, res) => {
         const engine = await initializeTorrent(magnetLink);
         const videoFiles = getVideoFiles(engine);
         
+        if (videoFiles.length === 0) {
+            engine.destroy();
+            return res.status(404).json({ error: 'No video files found in torrent' });
+        }
+
         // Store engine temporarily
         const tempId = Date.now().toString();
-        activeStreams.set(tempId, { engine, selected: false });
+        activeStreams.set(tempId, { 
+            engine,
+            selected: false,
+            progress: 0,
+            peers: 0
+        });
+
+        // Monitor this specific stream
+        engine.on('download', () => {
+            const progress = Math.round((engine.swarm.downloaded / engine.torrent.length) * 100);
+            const streamData = activeStreams.get(tempId);
+            if (streamData) {
+                streamData.progress = progress;
+                streamData.peers = engine.swarm.wires.length;
+            }
+        });
 
         // Cleanup after 5 minutes if no file is selected
         setTimeout(() => {
@@ -103,8 +162,27 @@ app.post('/files', async (req, res) => {
         });
     } catch (error) {
         console.error('Error getting files:', error);
-        res.status(500).json({ error: 'Failed to get files from torrent' });
+        res.status(500).json({ error: 'Failed to get files from torrent: ' + error.message });
     }
+});
+
+// Get stream status
+app.get('/status/:torrentId', (req, res) => {
+    const { torrentId } = req.params;
+    const streamData = activeStreams.get(torrentId);
+    
+    if (!streamData) {
+        return res.status(404).json({ error: 'Stream not found' });
+    }
+
+    const { engine, progress, peers } = streamData;
+    res.json({
+        progress,
+        peers,
+        downloaded: engine.swarm.downloaded,
+        downloadSpeed: engine.swarm.downloadSpeed(),
+        uploadSpeed: engine.swarm.uploadSpeed()
+    });
 });
 
 // Start streaming specific file
@@ -139,48 +217,73 @@ app.post('/stream', async (req, res) => {
             }
         });
 
+        // Wait for some initial pieces to download
+        await new Promise((resolve, reject) => {
+            const checkProgress = () => {
+                const progress = (engine.swarm.downloaded / file.length) * 100;
+                if (progress >= 1) { // Wait for at least 1% of the file
+                    resolve();
+                } else {
+                    setTimeout(checkProgress, 1000);
+                }
+            };
+            checkProgress();
+            
+            // Timeout after 30 seconds
+            setTimeout(() => {
+                reject(new Error('Timeout waiting for initial download'));
+            }, 30000);
+        });
+
         // Generate a unique ID for this stream
         const streamId = `${torrentId}_${fileIndex}`;
         
-        engine.server.on('listening', () => {
-            const serverPort = engine.server.address().port;
-            const sourceUrl = `http://${serverIP}:${serverPort}`;
-            
-            // Create HLS output directory for this stream
-            const streamHlsDir = path.join(hlsOutputDir, streamId);
-            if (!fs.existsSync(streamHlsDir)) {
-                fs.mkdirSync(streamHlsDir, { recursive: true });
-            }
+        // Create HLS output directory for this stream
+        const streamHlsDir = path.join(hlsOutputDir, streamId);
+        if (!fs.existsSync(streamHlsDir)) {
+            fs.mkdirSync(streamHlsDir, { recursive: true });
+        }
 
-            // Convert stream to HLS
-            ffmpeg(sourceUrl)
-                .outputOptions([
-                    '-c:v copy',
-                    '-c:a copy',
-                    '-hls_time 10',
-                    '-hls_list_size 6',
-                    '-hls_flags delete_segments',
-                    '-f hls'
-                ])
-                .output(path.join(streamHlsDir, 'playlist.m3u8'))
-                .on('end', () => {
-                    console.log('Streaming ended');
-                })
-                .on('error', (err) => {
-                    console.error('FFmpeg error:', err);
-                })
-                .run();
-
-            res.json({
-                streamId,
-                playlistUrl: `/hls/${streamId}/playlist.m3u8`,
-                fileName: file.name
+        // Start the server and get the URL
+        const serverPort = await new Promise((resolve) => {
+            engine.server.once('listening', () => {
+                resolve(engine.server.address().port);
             });
+        });
+
+        const sourceUrl = `http://${serverIP}:${serverPort}`;
+
+        // Convert stream to HLS
+        ffmpeg(sourceUrl)
+            .outputOptions([
+                '-c:v copy',
+                '-c:a copy',
+                '-hls_time 10',
+                '-hls_list_size 6',
+                '-hls_flags delete_segments',
+                '-f hls'
+            ])
+            .output(path.join(streamHlsDir, 'playlist.m3u8'))
+            .on('start', (cmd) => {
+                console.log('Started FFmpeg with command:', cmd);
+            })
+            .on('end', () => {
+                console.log('Streaming ended');
+            })
+            .on('error', (err) => {
+                console.error('FFmpeg error:', err);
+            })
+            .run();
+
+        res.json({
+            streamId,
+            playlistUrl: `/hls/${streamId}/playlist.m3u8`,
+            fileName: file.name
         });
 
     } catch (error) {
         console.error('Error starting stream:', error);
-        res.status(500).json({ error: 'Failed to start stream' });
+        res.status(500).json({ error: 'Failed to start stream: ' + error.message });
     }
 });
 
